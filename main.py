@@ -242,3 +242,46 @@ async def on_ready():
     print(f'บอท {bot.user} ออนไลน์พร้อมใช้งานแล้วค่ะ!')
 
 bot.run(os.getenv('DISCORD_TOKEN'))
+import os
+import discord
+from discord.ext import commands
+from discord import app_commands
+
+# ตั้งค่า Intents และสร้างตัวแปร bot
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(command_prefix="!", intents=intents)
+
+# สั่ง Sync คำสั่ง Slash Command เข้า Discord ตอนบอทออนไลน์
+@bot.event
+async def on_ready():
+    try:
+        synced = await bot.tree.sync()
+        print(f"Synced {len(synced)} command(s)")
+    except Exception as e:
+        print(f"Error syncing commands: {e}")
+    print(f'บอท {bot.user} ออนไลน์พร้อมใช้งานแล้วค่ะ!')
+
+# ==================== คำสั่ง Slash Commands (ใช้ /) ====================
+
+@bot.tree.command(name="สถานะ", description="เช็คสถานะการทำงานของบอท")
+async def status(interaction: discord.Interaction):
+    latency = round(bot.latency * 1000)
+    embed = discord.Embed(title="📊 สถานะการทำงานของบอท", color=discord.Color.green())
+    embed.add_field(name="🟢 ความเร็วปิง (Ping)", value=f"{latency} ms", inline=False)
+    embed.add_field(name="🛡️ เลเวลกันสแปม", value="Level 1", inline=False)
+    embed.add_field(name="🤖 สถานะบอท", value="`ออนไลน์พร้อมใช้งาน 24 ชม.`", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+@bot.tree.command(name="ช่วยเหลือ", description="ดูเมนูช่วยเหลือและคำสั่งทั้งหมด")
+async def help_command(interaction: discord.Interaction):
+    embed = discord.Embed(title="💖 เมนูช่วยเหลือบอท", color=discord.Color.blue())
+    embed.add_field(name="🎵 คำสั่งสำหรับสมาชิกทั่วไป", value="`/สถานะ` - เช็คสถานะบอท", inline=False)
+    embed.add_field(name="⚙️ คำสั่งสำหรับผู้ดูแลระบบ", value="ตั้งค่าระบบเพิ่มเติม", inline=False)
+    
+    await interaction.response.send_message(embed=embed)
+
+# รันบอทด้วย Token จาก Environment Variable
+bot.run(os.getenv('DISCORD_TOKEN'))
+    
