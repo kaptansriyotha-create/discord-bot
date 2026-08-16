@@ -355,5 +355,9 @@ def main():
 
 if __name__ == "__main__":
     main()
-# รันบอท
-bot.run(os.getenv('DISCORD_TOKEN
+@bot.command()
+@commands.is_owner()
+async def sync(ctx):
+    synced = await bot.tree.sync()
+    await ctx.send(f"✅ Sync คำสั่ง Slash Command ทั้งหมด {len(synced)} คำสั่งเรียบร้อยแล้ว!")
+    
