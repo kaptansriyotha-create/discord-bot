@@ -1,195 +1,425 @@
 import os
+import time
 import asyncio
 import discord
+
+from collections import defaultdict, deque
 from discord.ext import commands
-from discord import app_commands
-import yt_dlp
-from flask import Flask
-from threading import Thread
-from datetime import datetime, timedelta
 
-# ==================== Keep-Alive Server ====================
-app = Flask('')
-@app.route('/')
-def home():
-    return "Bot is online!"
+# ============================================================
+# CONFIG
+# ============================================================
 
-Thread(target=lambda: app.run(host='0.0.0.0', port=8080), daemon=True).start()
+DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
 
-# ==================== Config & Setup ====================
-DISCORD_TOKEN = os.getenv('DISCORD_TOKEN')
+# จำนวนข้อความสูงสุดที่ส่งได้ภายในช่วงเวลา
+SPAM_MESSAGE_LIMIT = 5
+SPAM_TIME_WINDOW = 5
+
+# จำนวนครั้งที่เตือนก่อน Timeout
+MAX_WARNINGS = 2
+
+# Timeout คนที่สแปม
+TIMEOUT_SECONDS = 60
+
+# กันข้อความซ้ำ
+DUPLICATE_LIMIT = 3
+
+# กัน Mention @everyone / @here
+MAX_MENTIONS = 5
+
+# กัน Raid สมาชิกเข้าเซิร์ฟเวอร์จำนวนมาก
+RAID_JOIN_LIMIT = 8
+RAID_TIME_WINDOW = 10
+
+
+# ============================================================
+# INTENTS
+# ============================================================
 
 intents = discord.Intents.default()
+
 intents.message_content = True
 intents.members = True
-intents.voice_states = True
 
-bot = commands.Bot(command_prefix="!", intents=intents)
 
-# ตั้งค่า YT-DLP สำหรับระบบเล่นเพลง
-ytdl_format_options = {
-    'format': 'bestaudio/best',
-    'noplaylist': True,
-    'quiet': True
-}
-ffmpeg_options = {
-    'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5',
-    'options': '-vn'
-}
-ytdl = yt_dlp.YoutubeDL(ytdl_format_options)
+bot = commands.Bot(
+    command_prefix="!",
+    intents=intents
+)
 
-# ตัวแปรเก็บประวัติการสแปมของผู้ใช้
-spam_tracker = {}
 
-@bot.event
-async def on_ready():
+# ============================================================
+# MEMORY
+# ============================================================
+
+# เก็บเวลาที่แต่ละคนส่งข้อความ
+message_history = defaultdict(deque)
+
+# เก็บข้อความล่าสุดของแต่ละคน
+last_messages = defaultdict(deque)
+
+# จำนวน Warning
+warnings = defaultdict(int)
+
+# เก็บเวลาสมาชิกเข้าเซิร์ฟเวอร์
+join_history = defaultdict(deque)
+
+
+# ============================================================
+# CHECK ADMIN
+# ============================================================
+
+def is_staff(member: discord.Member):
+
+    return (
+        member.guild_permissions.administrator
+        or member.guild_permissions.manage_messages
+    )
+
+
+# ============================================================
+# DELETE MESSAGE
+# ============================================================
+
+async def delete_message(message):
+
     try:
-        synced = await bot.tree.sync()
-        print(f"Synced {len(synced)} command(s) successfully!")
-    except Exception as e:
-        print(f"Error syncing commands: {e}")
-    print(f'บอท {bot.user} ออนไลน์พร้อมใช้งานแล้วค่ะ!')
+        await message.delete()
+    except (
+        discord.NotFound,
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+        pass
 
-# ==================== ระบบ Anti-Spam 3 Level ====================
-@bot.event
-async def on_message(message):
-    if message.author.bot or not message.guild:
-        return
 
-    # ข้ามการตรวจถ้าผู้ใช้เป็นแอดมิน
-    if message.author.guild_permissions.administrator:
-        await bot.process_commands(message)
-        return
+# ============================================================
+# TIMEOUT USER
+# ============================================================
 
-    user_id = message.author.id
-    now = datetime.utcnow()
+async def timeout_user(member):
 
-    if user_id not in spam_tracker:
-        spam_tracker[user_id] = {
-            "timestamps": [],
-            "warnings": 0,
-            "last_warning": now
-        }
+    try:
 
-    user_data = spam_tracker[user_id]
-    
-    # รีเซ็ตการเตือนถ้าเวลาผ่านไปเกิน 10 นาทีโดยไม่ทำผิดซ้ำ
-    if (now - user_data["last_warning"]).total_seconds() > 600:
-        user_data["warnings"] = 0
+        until = discord.utils.utcnow() + discord.timedelta(
+            seconds=TIMEOUT_SECONDS
+        )
 
-    # ตรวจจับข้อความที่ส่งใน 3 วินาทีล่าสุด
-    user_data["timestamps"] = [t for t in user_data["timestamps"] if (now - t).total_seconds() < 3]
-    user_data["timestamps"].append(now)
+        await member.timeout(
+            until,
+            reason="Anti-Spam"
+        )
 
-    # เงื่อนไขเมื่อตรวจพบการส่งรัว (มากกว่า 3 ข้อความใน 3 วินาที)
-    if len(user_data["timestamps"]) > 3:
+    except (
+        discord.Forbidden,
+        discord.HTTPException
+    ):
+        pass
+
+
+# ============================================================
+# ANTI SPAM
+# ============================================================
+
+async def anti_spam(message):
+
+    if message.author.bot:
+        return False
+
+    if not message.guild:
+        return False
+
+    member = message.author
+
+    # Admin / Staff ไม่โดนระบบ
+    if is_staff(member):
+        return False
+
+    user_id = member.id
+    now = time.monotonic()
+
+    history = message_history[user_id]
+
+    # ลบข้อมูลเก่าที่เกินช่วงเวลา
+    while history and now - history[0] > SPAM_TIME_WINDOW:
+        history.popleft()
+
+    history.append(now)
+
+    # ========================================================
+    # ตรวจจับส่งข้อความรัว
+    # ========================================================
+
+    if len(history) > SPAM_MESSAGE_LIMIT:
+
+        await delete_message(message)
+
+        warnings[user_id] += 1
+
         try:
-            await message.delete()
+            await message.channel.send(
+                f"⚠️ {member.mention} ส่งข้อความเร็วเกินไป",
+                delete_after=5
+            )
         except:
             pass
 
-        user_data["warnings"] += 1
-        user_data["last_warning"] = now
-        user_data["timestamps"] = []  # รีเซ็ตการนับรอบสแปมชั่วคราว
+        # ถึงจำนวน Warning ที่กำหนด
+        if warnings[user_id] >= MAX_WARNINGS:
 
-        warn_level = user_data["warnings"]
+            await timeout_user(member)
 
-        # Level 1: เตือนในแชท
-        if warn_level == 1:
-            await message.channel.send(
-                f"⚠️ **[Anti-Spam Level 1]** {message.author.mention} กรุณาหยุดสแปมข้อความ! (เตือนครั้งที่ 1)",
-                delete_after=5
-            )
+            warnings[user_id] = 0
 
-        # Level 2: Timeout 5 นาที
-        elif warn_level == 2:
+        return True
+
+    # ========================================================
+    # ตรวจข้อความซ้ำ
+    # ========================================================
+
+    content = message.content.strip().lower()
+
+    if content:
+
+        messages = last_messages[user_id]
+
+        messages.append(content)
+
+        while len(messages) > DUPLICATE_LIMIT:
+            messages.popleft()
+
+        if (
+            len(messages) == DUPLICATE_LIMIT
+            and len(set(messages)) == 1
+        ):
+
+            await delete_message(message)
+
+            warnings[user_id] += 1
+
             try:
-                await message.author.timeout(timedelta(minutes=5), reason="Anti-Spam Level 2: สแปมข้อความซ้ำ")
                 await message.channel.send(
-                    f"🔇 **[Anti-Spam Level 2]** {message.author.mention} ถูกระงับการพิมพ์เป็นเวลา 5 นาที เนื่องจากสแปมข้อความซ้ำ"
+                    f"⚠️ {member.mention} ห้ามส่งข้อความซ้ำ",
+                    delete_after=5
                 )
-            except Exception as e:
-                await message.channel.send(f"❌ ไม่สามารถระงับการพิมพ์ {message.author.mention} ได้: {e}")
+            except:
+                pass
 
-        # Level 3: Ban ออกจากเซิร์ฟเวอร์
-        elif warn_level >= 3:
-            try:
-                await message.author.ban(reason="Anti-Spam Level 3: ทำผิดกฎสแปมครบ 3 ครั้ง")
-                await message.channel.send(
-                    f"🚨 **[Anti-Spam Level 3]** แบน {message.author.mention} ออกจากเซิร์ฟเวอร์ถาวรเนื่องจากสแปมข้อความขั้นรุนแรง!"
-                )
-            except Exception as e:
-                await message.channel.send(f"❌ ไม่สามารถแบน {message.author.mention} ได้: {e}")
+            if warnings[user_id] >= MAX_WARNINGS:
 
+                await timeout_user(member)
+
+                warnings[user_id] = 0
+
+            return True
+
+    # ========================================================
+    # ตรวจ Mention จำนวนมาก
+    # ========================================================
+
+    total_mentions = (
+        len(message.mentions)
+        + len(message.role_mentions)
+    )
+
+    if message.mention_everyone:
+        total_mentions += 2
+
+    if total_mentions >= MAX_MENTIONS:
+
+        await delete_message(message)
+
+        warnings[user_id] += 1
+
+        if warnings[user_id] >= MAX_WARNINGS:
+
+            await timeout_user(member)
+
+            warnings[user_id] = 0
+
+        return True
+
+    return False
+
+
+# ============================================================
+# ANTI RAID
+# ============================================================
+
+async def anti_raid(member):
+
+    if member.bot:
         return
 
-    await bot.process_commands(message)
+    guild_id = member.guild.id
 
-# ==================== Slash Commands ====================
+    now = time.monotonic()
 
-# 1. เช็คสถานะบอทตามรูปแบบที่กำหนด
-@bot.tree.command(name="สถานะ", description="เช็คสถานะการทำงานและระบบป้องกันของบอท")
-async def status(interaction: discord.Interaction):
-    latency = round(bot.latency * 1000)
-    
-    embed = discord.Embed(title="📊 สถานะการทำงานของบอท", color=discord.Color.green())
-    embed.add_field(name="🛡️ ระบบป้องกันอยู่เลเวล", value="Level 3 (Warn -> Timeout -> Ban)", inline=False)
-    embed.add_field(name="🤖 สถานะออน", value="ออนไลน์พร้อมใช้งาน 24 ชั่วโมง", inline=False)
-    embed.add_field(name="🟢 ความเร็วปิง", value=f"{latency} ms", inline=False)
-    
-    await interaction.response.send_message(embed=embed)
+    history = join_history[guild_id]
 
-# 2. ระบบเล่นเพลงจาก YouTube Link
-@bot.tree.command(name="play", description="เล่นเพลงจาก URL YouTube")
-async def play(interaction: discord.Interaction, url: str):
-    if not interaction.user.voice:
-        return await interaction.response.send_message("❌ คุณต้องเชื่อมต่อกับห้องเสียงก่อนค่ะ!", ephemeral=True)
+    # ลบข้อมูลเก่า
+    while history and now - history[0] > RAID_TIME_WINDOW:
+        history.popleft()
 
-    await interaction.response.defer()
+    history.append(now)
 
-    voice_channel = interaction.user.voice.channel
-    voice_client = interaction.guild.voice_client
+    # ========================================================
+    # ตรวจสมาชิกเข้าเยอะผิดปกติ
+    # ========================================================
 
-    if not voice_client:
-        voice_client = await voice_channel.connect()
-    elif voice_client.channel != voice_channel:
-        await voice_client.move_to(voice_channel)
+    if len(history) >= RAID_JOIN_LIMIT:
+
+        # แจ้งเจ้าของ / ผู้ดูแลเซิร์ฟเวอร์
+        try:
+
+            owner = member.guild.owner
+
+            if owner:
+
+                await owner.send(
+                    f"🚨 **ตรวจพบความเสี่ยง Raid**\n"
+                    f"เซิร์ฟเวอร์: {member.guild.name}\n"
+                    f"มีสมาชิกเข้า {len(history)} คน "
+                    f"ภายใน {RAID_TIME_WINDOW} วินาที"
+                )
+
+        except:
+            pass
+
+        # ====================================================
+        # เปิดโหมด Raid Protection
+        # ====================================================
+
+        try:
+
+            for channel in member.guild.text_channels:
+
+                if channel.permissions_for(
+                    member.guild.me
+                ).manage_messages:
+
+                    # ไม่ปิดห้องโดยอัตโนมัติ
+                    # เพื่อป้องกันการล็อกเซิร์ฟเวอร์ผิดพลาด
+                    pass
+
+        except:
+            pass
+
+
+# ============================================================
+# MESSAGE EVENT
+# ============================================================
+
+@bot.event
+async def on_message(message):
 
     try:
-        loop = asyncio.get_event_loop()
-        data = await loop.run_in_executor(None, lambda: ytdl.extract_info(url, download=False))
-        
-        if 'entries' in data:
-            data = data['entries'][0]
 
-        audio_url = data['url']
-        title = data.get('title', 'ไม่ทราบชื่อเพลง')
+        blocked = await anti_spam(message)
 
-        if voice_client.is_playing():
-            voice_client.stop()
+        if blocked:
+            return
 
-        source = discord.FFmpegPCMAudio(audio_url, **ffmpeg_options)
-        voice_client.play(source)
+        await bot.process_commands(message)
 
-        embed = discord.Embed(title="🎵 กำลังเล่นเพลง", description=f"[{title}]({url})", color=discord.Color.blue())
-        await interaction.followup.send(embed=embed)
+    except Exception as error:
 
-    except Exception as e:
-        await interaction.followup.send(f"❌ เกิดข้อผิดพลาดในการดึงเพลง: {e}")
+        print(
+            f"[Anti-Spam Error] {error}"
+        )
 
-@bot.tree.command(name="stop", description="หยุดเล่นเพลงและออกจากห้องเสียง")
-async def stop(interaction: discord.Interaction):
-    voice_client = interaction.guild.voice_client
-    if voice_client and voice_client.is_connected():
-        await voice_client.disconnect()
-        await interaction.response.send_message("⏹️ หยุดเล่นเพลงและออกจากห้องเรียบร้อยแล้วค่ะ")
-    else:
-        await interaction.response.send_message("❌ บอทไม่ได้อยู่ในห้องเสียงค่ะ", ephemeral=True)
 
-# ==================== Start Bot ====================
-if __name__ == "__main__":
-    if DISCORD_TOKEN:
-        bot.run(DISCORD_TOKEN)
-    else:
-        print("❌ ไม่พบ DISCORD_TOKEN ใน Environment Variables")
-    
+# ============================================================
+# MEMBER JOIN EVENT
+# ============================================================
+
+@bot.event
+async def on_member_join(member):
+
+    try:
+
+        await anti_raid(member)
+
+    except Exception as error:
+
+        print(
+            f"[Anti-Raid Error] {error}"
+        )
+
+
+# ============================================================
+# BOT READY
+# ============================================================
+
+@bot.event
+async def on_ready():
+
+    print("=" * 50)
+
+    print(
+        f"✅ Bot Online: {bot.user}"
+    )
+
+    print(
+        f"🛡️ Anti-Spam: ON"
+    )
+
+    print(
+        f"🛡️ Anti-Raid: ON"
+    )
+
+    print(
+        f"📡 Servers: {len(bot.guilds)}"
+    )
+
+    print("=" * 50)
+
+
+# ============================================================
+# STATUS COMMAND
+# ============================================================
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def security(ctx):
+
+    embed = discord.Embed(
+        title="🛡️ ระบบรักษาความปลอดภัย",
+        description=(
+            "ระบบป้องกันของบอทกำลังทำงาน\n\n"
+            "🟢 Anti-Spam: เปิด\n"
+            "🟢 Anti-Raid: เปิด\n"
+            "🟢 Duplicate Protection: เปิด\n"
+            "🟢 Mention Protection: เปิด"
+        ),
+        color=discord.Color.green()
+    )
+
+    await ctx.send(embed=embed)
+
+
+# ============================================================
+# ERROR HANDLER
+# ============================================================
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+
+    print(
+        f"[Discord Error] {event}"
+    )
+
+
+# ============================================================
+# START BOT
+# ============================================================
+
+if not DISCORD_TOKEN:
+
+    raise RuntimeError(
+        "ไม่พบ DISCORD_TOKEN ใน Environment Variables"
+    )
+
+
+bot.run(DISCORD_TOKEN)
