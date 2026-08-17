@@ -1,425 +1,241 @@
-import os
-import time
-import asyncio
+# ตัวอย่าง Discord anti-raid/anti-spam bot (Python, discord.py / py-cord)
+# ติดตั้ง: pip install -U "discord.py"  หรือ pip install -U py-cord
+# ตั้งค่า: แก้ค่าใน CONFIG ก่อนรัน
+
 import discord
-
+from discord.ext import commands, tasks
+import asyncio
+import re
+import time
 from collections import defaultdict, deque
-from discord.ext import commands
 
-# ============================================================
-# CONFIG
-# ============================================================
-
-DISCORD_TOKEN = os.getenv("DISCORD_TOKEN")
-
-# จำนวนข้อความสูงสุดที่ส่งได้ภายในช่วงเวลา
-SPAM_MESSAGE_LIMIT = 5
-SPAM_TIME_WINDOW = 5
-
-# จำนวนครั้งที่เตือนก่อน Timeout
-MAX_WARNINGS = 2
-
-# Timeout คนที่สแปม
-TIMEOUT_SECONDS = 60
-
-# กันข้อความซ้ำ
-DUPLICATE_LIMIT = 3
-
-# กัน Mention @everyone / @here
-MAX_MENTIONS = 5
-
-# กัน Raid สมาชิกเข้าเซิร์ฟเวอร์จำนวนมาก
-RAID_JOIN_LIMIT = 8
-RAID_TIME_WINDOW = 10
-
-
-# ============================================================
-# INTENTS
-# ============================================================
+# ========== CONFIG ==========
+TOKEN = "YOUR_BOT_TOKEN_HERE"  # อย่าแชร์ token
+MOD_LOG_CHANNEL = "mod-log"    # channel name สำหรับบันทึกเหตุการณ์
+MUTE_ROLE_NAME = "Muted"       # role ที่มิวท์ผู้ใช้
+ANTI_RAID_WINDOW = 20          # วินาที สำหรับนับการเข้าพร้อมกัน
+ANTI_RAID_THRESHOLD = 5        # ถ้ามีสมาชิกเข้ามากกว่าเท่านี้ภายใน window => แจ้ง/แบน
+SPAM_MESSAGE_LIMIT = 5         # ข้อความเกินภายใน SPAM_SECONDS ถือว่าเป็นสแปม
+SPAM_SECONDS = 7
+SPAM_MUTE_SECONDS = 300        # มิวท์เป็นเวลา (วินาที)
+MASS_MENTION_THRESHOLD = 5     # ถ้ามี mentions มากกว่านี้ => ลบ/แบน
+BLOCK_INVITES = True           # ลบข้อความที่มีลิงก์ invite discord
+# ============================
 
 intents = discord.Intents.default()
-
-intents.message_content = True
 intents.members = True
+intents.messages = True
+intents.message_content = True  # ต้องเปิดใน dev portal ถ้าต้องอ่านเนื้อหาข้อความ
 
+bot = commands.Bot(command_prefix="!", intents=intents)
 
-bot = commands.Bot(
-    command_prefix="!",
-    intents=intents
-)
+# In-memory stores (สำหรับตัวอย่าง) — ถ้าต้องการเก็บถาวรใช้ DB
+recent_joins = deque()  # list of (timestamp, member.id)
+user_messages = defaultdict(lambda: deque())  # user_id -> deque of timestamps
+last_message_content = {}  # user_id -> last message content
+muted_timers = {}  # user_id -> unmute_time
 
+INVITE_REGEX = re.compile(r"(discord(?:\.gg|app\.com\/invite)\/\S+)", re.IGNORECASE)
 
-# ============================================================
-# MEMORY
-# ============================================================
-
-# เก็บเวลาที่แต่ละคนส่งข้อความ
-message_history = defaultdict(deque)
-
-# เก็บข้อความล่าสุดของแต่ละคน
-last_messages = defaultdict(deque)
-
-# จำนวน Warning
-warnings = defaultdict(int)
-
-# เก็บเวลาสมาชิกเข้าเซิร์ฟเวอร์
-join_history = defaultdict(deque)
-
-
-# ============================================================
-# CHECK ADMIN
-# ============================================================
-
-def is_staff(member: discord.Member):
-
-    return (
-        member.guild_permissions.administrator
-        or member.guild_permissions.manage_messages
-    )
-
-
-# ============================================================
-# DELETE MESSAGE
-# ============================================================
-
-async def delete_message(message):
-
-    try:
-        await message.delete()
-    except (
-        discord.NotFound,
-        discord.Forbidden,
-        discord.HTTPException
-    ):
-        pass
-
-
-# ============================================================
-# TIMEOUT USER
-# ============================================================
-
-async def timeout_user(member):
-
-    try:
-
-        until = discord.utils.utcnow() + discord.timedelta(
-            seconds=TIMEOUT_SECONDS
-        )
-
-        await member.timeout(
-            until,
-            reason="Anti-Spam"
-        )
-
-    except (
-        discord.Forbidden,
-        discord.HTTPException
-    ):
-        pass
-
-
-# ============================================================
-# ANTI SPAM
-# ============================================================
-
-async def anti_spam(message):
-
-    if message.author.bot:
-        return False
-
-    if not message.guild:
-        return False
-
-    member = message.author
-
-    # Admin / Staff ไม่โดนระบบ
-    if is_staff(member):
-        return False
-
-    user_id = member.id
-    now = time.monotonic()
-
-    history = message_history[user_id]
-
-    # ลบข้อมูลเก่าที่เกินช่วงเวลา
-    while history and now - history[0] > SPAM_TIME_WINDOW:
-        history.popleft()
-
-    history.append(now)
-
-    # ========================================================
-    # ตรวจจับส่งข้อความรัว
-    # ========================================================
-
-    if len(history) > SPAM_MESSAGE_LIMIT:
-
-        await delete_message(message)
-
-        warnings[user_id] += 1
-
-        try:
-            await message.channel.send(
-                f"⚠️ {member.mention} ส่งข้อความเร็วเกินไป",
-                delete_after=5
-            )
-        except:
-            pass
-
-        # ถึงจำนวน Warning ที่กำหนด
-        if warnings[user_id] >= MAX_WARNINGS:
-
-            await timeout_user(member)
-
-            warnings[user_id] = 0
-
-        return True
-
-    # ========================================================
-    # ตรวจข้อความซ้ำ
-    # ========================================================
-
-    content = message.content.strip().lower()
-
-    if content:
-
-        messages = last_messages[user_id]
-
-        messages.append(content)
-
-        while len(messages) > DUPLICATE_LIMIT:
-            messages.popleft()
-
-        if (
-            len(messages) == DUPLICATE_LIMIT
-            and len(set(messages)) == 1
-        ):
-
-            await delete_message(message)
-
-            warnings[user_id] += 1
-
+# Helpers
+async def log_guild(guild: discord.Guild, msg: str):
+    # หา channel ที่ตั้งชื่อไว้ แล้วส่ง log
+    for ch in guild.text_channels:
+        if ch.name == MOD_LOG_CHANNEL:
             try:
-                await message.channel.send(
-                    f"⚠️ {member.mention} ห้ามส่งข้อความซ้ำ",
-                    delete_after=5
-                )
-            except:
+                await ch.send(msg)
+            except Exception:
                 pass
-
-            if warnings[user_id] >= MAX_WARNINGS:
-
-                await timeout_user(member)
-
-                warnings[user_id] = 0
-
-            return True
-
-    # ========================================================
-    # ตรวจ Mention จำนวนมาก
-    # ========================================================
-
-    total_mentions = (
-        len(message.mentions)
-        + len(message.role_mentions)
-    )
-
-    if message.mention_everyone:
-        total_mentions += 2
-
-    if total_mentions >= MAX_MENTIONS:
-
-        await delete_message(message)
-
-        warnings[user_id] += 1
-
-        if warnings[user_id] >= MAX_WARNINGS:
-
-            await timeout_user(member)
-
-            warnings[user_id] = 0
-
-        return True
-
-    return False
-
-
-# ============================================================
-# ANTI RAID
-# ============================================================
-
-async def anti_raid(member):
-
-    if member.bot:
-        return
-
-    guild_id = member.guild.id
-
-    now = time.monotonic()
-
-    history = join_history[guild_id]
-
-    # ลบข้อมูลเก่า
-    while history and now - history[0] > RAID_TIME_WINDOW:
-        history.popleft()
-
-    history.append(now)
-
-    # ========================================================
-    # ตรวจสมาชิกเข้าเยอะผิดปกติ
-    # ========================================================
-
-    if len(history) >= RAID_JOIN_LIMIT:
-
-        # แจ้งเจ้าของ / ผู้ดูแลเซิร์ฟเวอร์
-        try:
-
-            owner = member.guild.owner
-
-            if owner:
-
-                await owner.send(
-                    f"🚨 **ตรวจพบความเสี่ยง Raid**\n"
-                    f"เซิร์ฟเวอร์: {member.guild.name}\n"
-                    f"มีสมาชิกเข้า {len(history)} คน "
-                    f"ภายใน {RAID_TIME_WINDOW} วินาที"
-                )
-
-        except:
-            pass
-
-        # ====================================================
-        # เปิดโหมด Raid Protection
-        # ====================================================
-
-        try:
-
-            for channel in member.guild.text_channels:
-
-                if channel.permissions_for(
-                    member.guild.me
-                ).manage_messages:
-
-                    # ไม่ปิดห้องโดยอัตโนมัติ
-                    # เพื่อป้องกันการล็อกเซิร์ฟเวอร์ผิดพลาด
-                    pass
-
-        except:
-            pass
-
-
-# ============================================================
-# MESSAGE EVENT
-# ============================================================
-
-@bot.event
-async def on_message(message):
-
-    try:
-
-        blocked = await anti_spam(message)
-
-        if blocked:
             return
+    # ถ้าไม่เจอ channel ให้พิมพ์ใน console
+    print(f"[{guild.name}] {msg}")
 
-        await bot.process_commands(message)
-
-    except Exception as error:
-
-        print(
-            f"[Anti-Spam Error] {error}"
-        )
-
-
-# ============================================================
-# MEMBER JOIN EVENT
-# ============================================================
-
-@bot.event
-async def on_member_join(member):
-
+async def ensure_mute_role(guild: discord.Guild):
+    role = discord.utils.get(guild.roles, name=MUTE_ROLE_NAME)
+    if role:
+        return role
     try:
+        perms = discord.Permissions(send_messages=False, speak=False)
+        role = await guild.create_role(name=MUTE_ROLE_NAME, permissions=perms, reason="Create mute role for anti-spam bot")
+        # ปรับ channel overrides
+        for ch in guild.channels:
+            try:
+                await ch.set_permissions(role, send_messages=False, speak=False)
+            except Exception:
+                pass
+        return role
+    except Exception as e:
+        print("Failed to create mute role:", e)
+        return None
 
-        await anti_raid(member)
+async def mute_member(guild: discord.Guild, member: discord.Member, duration: int, reason: str = ""):
+    role = await ensure_mute_role(guild)
+    if role is None:
+        return False
+    try:
+        await member.add_roles(role, reason=reason)
+        unmute_time = time.time() + duration if duration else None
+        if unmute_time:
+            muted_timers[member.id] = unmute_time
+        await log_guild(guild, f"Muted {member.mention} for {duration}s. Reason: {reason}")
+        return True
+    except Exception as e:
+        print("mute error:", e)
+        return False
 
-    except Exception as error:
+async def unmute_member(guild: discord.Guild, member: discord.Member):
+    role = discord.utils.get(guild.roles, name=MUTE_ROLE_NAME)
+    if role and role in member.roles:
+        try:
+            await member.remove_roles(role, reason="Auto unmute by anti-spam bot")
+            await log_guild(guild, f"Unmuted {member.mention}")
+        except Exception as e:
+            print("unmute error:", e)
 
-        print(
-            f"[Anti-Raid Error] {error}"
-        )
-
-
-# ============================================================
-# BOT READY
-# ============================================================
+# Background task to check unmutes
+@tasks.loop(seconds=15)
+async def check_unmutes():
+    now = time.time()
+    to_unmute = [uid for uid, t in muted_timers.items() if t <= now]
+    for uid in to_unmute:
+        try:
+            for guild in bot.guilds:
+                member = guild.get_member(uid)
+                if member:
+                    await unmute_member(guild, member)
+        except Exception:
+            pass
+        muted_timers.pop(uid, None)
 
 @bot.event
 async def on_ready():
+    print(f"Logged in as {bot.user} (id: {bot.user.id})")
+    check_unmutes.start()
 
-    print("=" * 50)
+# Anti-raid: track joins
+@bot.event
+async def on_member_join(member: discord.Member):
+    ts = time.time()
+    recent_joins.append((ts, member.id))
+    # ลบ entry เก่าๆ
+    while recent_joins and recent_joins[0][0] < ts - ANTI_RAID_WINDOW:
+        recent_joins.popleft()
+    # Check threshold
+    if len(recent_joins) >= ANTI_RAID_THRESHOLD:
+        # ตัวอย่างการตอบโต้: แจ้งแอดมิน, ปิดชั่วคราว (ต้องการสิทธิ์ manage_guild)
+        guild = member.guild
+        await log_guild(guild, f"Potential raid detected: {len(recent_joins)} joins within {ANTI_RAID_WINDOW}s.")
+        # ตัวอย่าง: หา role ที่มี permission manage_guild (admins) แล้ว mention
+        msg = f"⚠️ Potential raid detected: {len(recent_joins)} new joins within {ANTI_RAID_WINDOW}s. Consider enabling verifications or locking invites."
+        await log_guild(guild, msg)
+        # คุณอาจเพิ่มการตั้งให้ kick/ban ทุกคนที่เข้าล่าสุด — ระวังผลกระทบ false positive
 
-    print(
-        f"✅ Bot Online: {bot.user}"
-    )
+# Anti-spam: rate-limit per user and mass mention protection
+@bot.event
+async def on_message(message: discord.Message):
+    if message.author.bot:
+        return
 
-    print(
-        f"🛡️ Anti-Spam: ON"
-    )
+    guild = message.guild
+    author_id = message.author.id
+    now = time.time()
 
-    print(
-        f"🛡️ Anti-Raid: ON"
-    )
+    # 1) Mass mention / everyone
+    if message.mention_everyone or len(message.mentions) >= MASS_MENTION_THRESHOLD:
+        try:
+            await message.delete()
+            await log_guild(guild, f"Deleted mass-mention by {message.author.mention} in {message.channel.mention}")
+            await message.channel.send(f"{message.author.mention}, mass mentions are not allowed.", delete_after=6)
+            # Optionally mute/ban
+            await mute_member(guild, message.author, SPAM_MUTE_SECONDS, reason="Mass mention")
+        except Exception:
+            pass
+        return
 
-    print(
-        f"📡 Servers: {len(bot.guilds)}"
-    )
+    # 2) Block invite links
+    if BLOCK_INVITES and INVITE_REGEX.search(message.content):
+        try:
+            await message.delete()
+            await log_guild(guild, f"Deleted invite link from {message.author.mention}")
+            await message.channel.send(f"{message.author.mention}, posting invite links is not allowed.", delete_after=6)
+        except Exception:
+            pass
+        return
 
-    print("=" * 50)
+    # 3) Repeated content
+    last = last_message_content.get(author_id)
+    if last and last == message.content and len(message.content) > 5:
+        # duplicate message => warn/mute
+        try:
+            await message.delete()
+            await log_guild(guild, f"Deleted repeated message from {message.author.mention}")
+            await mute_member(guild, message.author, SPAM_MUTE_SECONDS, reason="Repeated messages")
+        except Exception:
+            pass
+        last_message_content[author_id] = message.content
+        return
+    last_message_content[author_id] = message.content
 
+    # 4) Rate limit checks
+    dq = user_messages[author_id]
+    dq.append(now)
+    # remove old
+    while dq and dq[0] < now - SPAM_SECONDS:
+        dq.popleft()
+    if len(dq) > SPAM_MESSAGE_LIMIT:
+        # action: delete recent messages from user in channel (best-effort), mute
+        try:
+            # ลบข้อความล่าสุดของ user ใน channel (fetch messages)
+            def is_from_author(m):
+                return m.author.id == author_id
+            deleted = await message.channel.purge(limit=50, check=is_from_author, bulk=True)
+        except Exception:
+            deleted = []
+        await log_guild(guild, f"Detected spam from {message.author.mention}. Deleted {len(deleted)} messages.")
+        await mute_member(guild, message.author, SPAM_MUTE_SECONDS, reason="Spam rate limit exceeded")
+        try:
+            await message.channel.send(f"{message.author.mention}, you have been muted for spamming.", delete_after=8)
+        except Exception:
+            pass
+        # Reset user's message queue
+        user_messages[author_id].clear()
+        return
 
-# ============================================================
-# STATUS COMMAND
-# ============================================================
+    # allow commands to still work
+    await bot.process_commands(message)
+
+# Admin commands (requires manage_guild permission)
+@bot.command()
+@commands.has_guild_permissions(manage_guild=True)
+async def setmodlog(ctx, channel_name: str):
+    global MOD_LOG_CHANNEL
+    MOD_LOG_CHANNEL = channel_name
+    await ctx.send(f"Set mod log channel name to `{channel_name}`")
 
 @bot.command()
-@commands.has_permissions(administrator=True)
-async def security(ctx):
+@commands.has_guild_permissions(manage_guild=True)
+async def mute(ctx, member: discord.Member, seconds: int = SPAM_MUTE_SECONDS):
+    await mute_member(ctx.guild, member, seconds, reason=f"Manual mute by {ctx.author}")
+    await ctx.send(f"Muted {member.mention} for {seconds}s")
 
-    embed = discord.Embed(
-        title="🛡️ ระบบรักษาความปลอดภัย",
-        description=(
-            "ระบบป้องกันของบอทกำลังทำงาน\n\n"
-            "🟢 Anti-Spam: เปิด\n"
-            "🟢 Anti-Raid: เปิด\n"
-            "🟢 Duplicate Protection: เปิด\n"
-            "🟢 Mention Protection: เปิด"
-        ),
-        color=discord.Color.green()
-    )
+@bot.command()
+@commands.has_guild_permissions(manage_guild=True)
+async def unmute(ctx, member: discord.Member):
+    await unmute_member(ctx.guild, member)
+    await ctx.send(f"Unmuted {member.mention}")
 
-    await ctx.send(embed=embed)
+@bot.command()
+@commands.has_guild_permissions(manage_guild=True)
+async def status(ctx):
+    await ctx.send("Anti-raid/anti-spam bot running.")
 
-
-# ============================================================
-# ERROR HANDLER
-# ============================================================
-
+# Error handlers
 @bot.event
-async def on_error(event, *args, **kwargs):
+async def on_command_error(ctx, error):
+    if isinstance(error, commands.MissingPermissions):
+        await ctx.send("คุณไม่มีสิทธิ์เรียกคำสั่งนี้")
+    else:
+        print("Command error:", error)
 
-    print(
-        f"[Discord Error] {event}"
-    )
-
-
-# ============================================================
-# START BOT
-# ============================================================
-
-if not DISCORD_TOKEN:
-
-    raise RuntimeError(
-        "ไม่พบ DISCORD_TOKEN ใน Environment Variables"
-    )
-
-
-bot.run(DISCORD_TOKEN)
+if __name__ == "__main__":
+    bot.run(TOKEN)
